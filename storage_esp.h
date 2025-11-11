@@ -1,3 +1,8 @@
+/**
+ * @file storage_esp.h
+ * @brief ESP32 filesystem storage implementation using native ESP-IDF APIs.
+ * @author Armisuari
+ */
 #pragma once
 
 #include <interface/storage_interface.h>
