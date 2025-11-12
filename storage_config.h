@@ -21,7 +21,7 @@ enum class storage_filesystem_t {
 // Default filesystem selection
 #ifdef STORAGE_LITTLEFS_AVAILABLE
     #define STORAGE_DEFAULT_TYPE storage_filesystem_t::LITTLEFS
-    #define STORAGE_DEFAULT_PARTITION_LABEL "storage"
+    #define STORAGE_DEFAULT_PARTITION_LABEL "spiffs"
 #elif defined(STORAGE_SPIFFS_AVAILABLE)
     #define STORAGE_DEFAULT_TYPE storage_filesystem_t::SPIFFS
     #define STORAGE_DEFAULT_PARTITION_LABEL "spiffs"
@@ -32,3 +32,8 @@ enum class storage_filesystem_t {
 // Storage configuration
 #define STORAGE_FORMAT_IF_MOUNT_FAILS true
 #define STORAGE_MAX_FILES 10
+
+// File versioning configuration
+#define STORAGE_ENABLE_VERSIONING true
+#define STORAGE_MAX_VERSION_HISTORY 5  // Keep last N versions of each file
+#define STORAGE_VERSION_METADATA_EXT ".meta"  // Extension for metadata files

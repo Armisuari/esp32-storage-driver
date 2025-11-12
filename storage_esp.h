@@ -31,6 +31,11 @@
 #include <sys/stat.h>
 #include <dirent.h>
 
+#if STORAGE_ENABLE_VERSIONING
+#include <vector>
+#include <algorithm>
+#endif
+
 /**
  * @class mutex_guard
  * @brief RAII wrapper for FreeRTOS mutex
@@ -59,12 +64,44 @@ private:
 };
 
 /**
+ * @struct file_version_metadata
+ * @brief Structure to store file version information
+ */
+struct file_version_metadata {
+    uint32_t current_version;     ///< Current version number (increments on each write)
+    uint32_t timestamp;           ///< Last modification timestamp (epoch seconds)
+    uint32_t file_size;           ///< Size of the current version
+    uint32_t checksum;            ///< Simple CRC32 checksum of file content
+    uint32_t version_count;       ///< Number of historical versions stored
+    uint32_t versions[STORAGE_MAX_VERSION_HISTORY]; ///< List of available version numbers
+    
+    // Default constructor
+    file_version_metadata() : current_version(0), timestamp(0), file_size(0), 
+                             checksum(0), version_count(0) {
+        for (int i = 0; i < STORAGE_MAX_VERSION_HISTORY; i++) {
+            versions[i] = 0;
+        }
+    }
+};
+
+/**
+ * @struct file_version_info
+ * @brief Public interface for file version information
+ */
+struct file_version_info {
+    uint32_t version;
+    uint32_t timestamp;
+    size_t size;
+    bool is_current;
+};
+
+/**
  * @class storage_esp
  * @brief ESP32 filesystem storage implementation using native ESP-IDF APIs
  * 
  * This class provides a unified interface to ESP32 filesystem operations,
  * supporting both LittleFS and SPIFFS using native ESP-IDF APIs without
- * Arduino framework dependencies.
+ * Arduino framework dependencies. Now includes file versioning capabilities.
  */
 class storage_esp : public storage_interface
 {
@@ -154,6 +191,63 @@ class storage_esp : public storage_interface
          */
         std::string get_full_path(const std::string& key) const;
 
+        // ========== File Versioning Methods ==========
+        
+        /**
+         * @brief Get current version number of a file
+         * @param key File path/key
+         * @return Current version number, 0 if file doesn't exist
+         */
+        uint32_t get_file_version(const std::string& key);
+        
+        /**
+         * @brief Get comprehensive version information for a file
+         * @param key File path/key
+         * @param[out] info Version information structure
+         * @return true if file exists and info retrieved
+         */
+        bool get_file_version_info(const std::string& key, file_version_info& info);
+        
+        /**
+         * @brief List all available versions of a file
+         * @param key File path/key
+         * @return Vector of version information for all stored versions
+         */
+        std::vector<file_version_info> list_file_versions(const std::string& key);
+        
+        /**
+         * @brief Read a specific version of a file
+         * @param key File path/key
+         * @param version Version number to read (0 = current version)
+         * @param data Buffer to store read data
+         * @param dataSize Size of data to read
+         * @return true if successfully read
+         */
+        bool read_file_version(const std::string& key, uint32_t version, void* data, size_t dataSize);
+        
+        /**
+         * @brief Check if a file has been modified since a specific version
+         * @param key File path/key
+         * @param last_known_version Last known version number
+         * @return true if file has been modified (version is newer)
+         */
+        bool file_has_changed(const std::string& key, uint32_t last_known_version);
+        
+        /**
+         * @brief Restore a file to a previous version
+         * @param key File path/key
+         * @param version Version number to restore to
+         * @return true if successfully restored
+         */
+        bool restore_file_version(const std::string& key, uint32_t version);
+        
+        /**
+         * @brief Clean up old versions beyond the configured history limit
+         * @param key File path/key (if empty, cleans all files)
+         * @return Number of versions cleaned up
+         */
+        uint32_t cleanup_old_versions(const std::string& key = "");
+
     private:
         storage_filesystem_t _fs_type;        ///< Selected filesystem type
         const char* _partition_label;         ///< Partition label
@@ -239,5 +333,75 @@ class storage_esp : public storage_interface
          * @param key File path/key
          * @return true if file exists, false otherwise
          */
+        bool _exists_internal(const std::string& key);
+
+        /**
+         * @brief Internal implementation of exists without locking
+         * @param key File path/key
+         * @return true if file exists, false otherwise
+         */
         bool _exists_impl(const std::string& key);
+
+        // ========== Private Versioning Helper Methods ==========
+        
+        /**
+         * @brief Get metadata file path for a given file key
+         * @param key File path/key
+         * @return Metadata file path
+         */
+        std::string _get_metadata_path(const std::string& key) const;
+        
+        /**
+         * @brief Get versioned file path for a given file key and version
+         * @param key File path/key
+         * @param version Version number
+         * @return Versioned file path
+         */
+        std::string _get_version_path(const std::string& key, uint32_t version) const;
+        
+        /**
+         * @brief Load metadata for a file
+         * @param key File path/key
+         * @param[out] metadata Metadata structure to fill
+         * @return true if metadata loaded successfully
+         */
+        bool _load_metadata(const std::string& key, file_version_metadata& metadata);
+        
+        /**
+         * @brief Save metadata for a file
+         * @param key File path/key
+         * @param metadata Metadata structure to save
+         * @return true if metadata saved successfully
+         */
+        bool _save_metadata(const std::string& key, const file_version_metadata& metadata);
+        
+        /**
+         * @brief Calculate CRC32 checksum of data
+         * @param data Data to checksum
+         * @param length Data length
+         * @return CRC32 checksum
+         */
+        uint32_t _calculate_crc32(const void* data, size_t length) const;
+        
+        /**
+         * @brief Get current timestamp in epoch seconds
+         * @return Current timestamp
+         */
+        uint32_t _get_timestamp() const;
+        
+        /**
+         * @brief Archive current file as a versioned backup
+         * @param key File path/key
+         * @param metadata Current metadata
+         * @return true if archiving successful
+         */
+        bool _archive_current_version(const std::string& key, file_version_metadata& metadata);
+        
+        /**
+         * @brief Remove oldest version to make room for new ones
+         * @param key File path/key
+         * @param metadata Current metadata (will be updated)
+         * @return true if cleanup successful
+         */
+        bool _cleanup_oldest_version(const std::string& key, file_version_metadata& metadata);
 };

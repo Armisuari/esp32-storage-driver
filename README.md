@@ -265,3 +265,176 @@ Enable the filesystem in `sdkconfig`:
 CONFIG_LITTLEFS_PAGE_SIZE=256
 CONFIG_LITTLEFS_OBJ_NAME_LEN=64
 ```
+
+## File Versioning Features
+
+### Overview
+
+The enhanced storage driver now includes comprehensive file versioning capabilities:
+
+- **Automatic Version Tracking**: Every file write automatically increments the version number
+- **Version History**: Configurable number of previous versions kept (default: 5)
+- **Metadata Storage**: Each file has associated metadata with version, timestamp, size, and checksum
+- **Change Detection**: Easy detection of file modifications since last known version
+- **Version Restoration**: Ability to restore files to previous versions
+- **Thread-Safe Operations**: All versioning operations are protected by the same mutex system
+
+### Configuration
+
+Enable versioning in `storage_config.h`:
+
+```cpp
+// File versioning configuration
+#define STORAGE_ENABLE_VERSIONING true
+#define STORAGE_MAX_VERSION_HISTORY 5  // Keep last N versions of each file
+#define STORAGE_VERSION_METADATA_EXT ".meta"  // Extension for metadata files
+```
+
+### Basic Versioning Usage
+
+```cpp
+storage_esp storage;
+storage.begin();
+
+// Write initial version (automatically becomes version 1)
+std::string config_v1 = R"({"timeout": 5000})";
+storage.write_file("config.json", config_v1.c_str(), config_v1.length());
+
+// Write updated version (automatically becomes version 2)
+std::string config_v2 = R"({"timeout": 3000, "retries": 3})";
+storage.write_file("config.json", config_v2.c_str(), config_v2.length());
+
+// Check current version
+uint32_t current_version = storage.get_file_version("config.json");
+ESP_LOGI("app", "Current version: %d", current_version); // Prints: 2
+
+// Check if file has changed since version 1
+if (storage.file_has_changed("config.json", 1)) {
+    ESP_LOGI("app", "File has been modified!");
+}
+```
+
+### Version Information and History
+
+```cpp
+// Get detailed version information
+file_version_info info;
+if (storage.get_file_version_info("config.json", info)) {
+    ESP_LOGI("app", "Version %d: %zu bytes, timestamp: %d", 
+             info.version, info.size, info.timestamp);
+}
+
+// List all available versions
+auto versions = storage.list_file_versions("config.json");
+for (const auto& ver : versions) {
+    ESP_LOGI("app", "Version %d: %zu bytes, current: %s", 
+             ver.version, ver.size, ver.is_current ? "yes" : "no");
+}
+```
+
+### Reading Specific Versions
+
+```cpp
+// Read current version (same as normal read_file)
+char current_data[256];
+storage.read_file("config.json", current_data, sizeof(current_data));
+
+// Read a specific version
+char version_1_data[256];
+storage.read_file_version("config.json", 1, version_1_data, sizeof(version_1_data));
+```
+
+### Version Restoration
+
+```cpp
+// Restore file to a previous version
+if (storage.restore_file_version("config.json", 1)) {
+    ESP_LOGI("app", "Successfully restored to version 1");
+    // This creates a new version with the content from version 1
+}
+```
+
+### Change Detection for IoT Applications
+
+```cpp
+// Typical IoT scenario: check for configuration updates
+class ConfigManager {
+private:
+    storage_esp* storage;
+    uint32_t last_known_config_version = 0;
+
+public:
+    void check_for_config_updates() {
+        if (storage->file_has_changed("device_config.json", last_known_config_version)) {
+            ESP_LOGI("config", "Configuration updated, reloading...");
+            load_config();
+            last_known_config_version = storage->get_file_version("device_config.json");
+        }
+    }
+    
+    void load_config() {
+        size_t config_size = storage->file_size("device_config.json");
+        std::vector<char> config_data(config_size);
+        if (storage->read_file("device_config.json", config_data.data(), config_size)) {
+            // Parse and apply configuration
+            parse_json_config(config_data.data());
+        }
+    }
+};
+```
+
+### Maintenance and Cleanup
+
+```cpp
+// Clean up old versions beyond the configured limit
+uint32_t cleaned = storage.cleanup_old_versions("large_log_file.txt");
+ESP_LOGI("app", "Cleaned up %d old versions", cleaned);
+
+// Clean up all files (if key is empty)
+storage.cleanup_old_versions("");
+```
+
+### File Structure
+
+With versioning enabled, the filesystem structure looks like:
+
+```
+/storage/
+├── config.json           # Current version
+├── config.json.meta      # Metadata (version info, checksums, etc.)
+├── config.json.v1        # Version 1 backup
+├── config.json.v2        # Version 2 backup
+├── sensor_data.csv       # Current version
+├── sensor_data.csv.meta  # Metadata
+└── sensor_data.csv.v1    # Version 1 backup
+```
+
+### Performance Considerations
+
+- **Write Performance**: Each write operation now involves metadata updates and potentially archiving the current version
+- **Storage Usage**: Each versioned file uses approximately `(history_count + 1) * average_file_size` storage
+- **Memory Usage**: Metadata structures are small (~100 bytes per file)
+- **Thread Safety**: All versioning operations are atomic and thread-safe
+
+### Migration from Non-Versioned Files
+
+Existing files without version metadata will automatically start versioning from version 1 when first written to with the enhanced driver.
+
+### Error Handling
+
+```cpp
+// Version-related operations have specific error handling
+uint32_t version = storage.get_file_version("nonexistent.txt");
+if (version == 0) {
+    ESP_LOGW("app", "File doesn't exist or has no version info");
+}
+
+// Check if specific version exists before reading
+auto versions = storage.list_file_versions("config.json");
+bool version_3_exists = std::any_of(versions.begin(), versions.end(),
+                                   [](const auto& v) { return v.version == 3; });
+if (version_3_exists) {
+    // Safe to read version 3
+    storage.read_file_version("config.json", 3, buffer, size);
+}
+```
