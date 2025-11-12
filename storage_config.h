@@ -15,7 +15,7 @@ enum class storage_filesystem_t {
 };
 
 // Filesystem availability flags
-// #define STORAGE_SPIFFS_AVAILABLE
+#define STORAGE_SPIFFS_AVAILABLE
 #define STORAGE_LITTLEFS_AVAILABLE
 
 // Default filesystem selection
@@ -24,7 +24,7 @@ enum class storage_filesystem_t {
     #define STORAGE_DEFAULT_PARTITION_LABEL "storage"
 #elif defined(STORAGE_SPIFFS_AVAILABLE)
     #define STORAGE_DEFAULT_TYPE storage_filesystem_t::SPIFFS
-    #define STORAGE_DEFAULT_PARTITION_LABEL "storage"
+    #define STORAGE_DEFAULT_PARTITION_LABEL "spiffs"
 #else
     #error "No storage filesystem is available. Please define at least one filesystem type."
 #endif

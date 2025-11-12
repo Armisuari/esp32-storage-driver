@@ -461,6 +461,12 @@ bool storage_esp::_is_valid_path(const std::string& key) const
 
 bool storage_esp::_ensure_directory_exists(const std::string& filepath) const
 {
+    // SPIFFS doesn't support directories - all files are in a flat namespace
+    // File paths with '/' are treated as part of the filename, not directory structure
+    if (_fs_type == storage_filesystem_t::SPIFFS) {
+        return true;  // No directory creation needed for SPIFFS
+    }
+    
     size_t last_slash = filepath.find_last_of('/');
     if (last_slash == std::string::npos) {
         // No directory component
