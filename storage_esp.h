@@ -170,13 +170,13 @@ class storage_esp : public storage_interface
          * @brief Get total filesystem size
          * @return Total size in bytes
          */
-        size_t total_size() const;
+        size_t total_size() override;
 
         /**
          * @brief Get used filesystem space
          * @return Used size in bytes
          */
-        size_t used_size() const;
+        size_t used_size() override;
 
         /**
          * @brief Format the filesystem (DANGEROUS - erases all data)

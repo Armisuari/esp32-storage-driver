@@ -283,7 +283,7 @@ bool storage_esp::exists(const std::string& key)
     return _exists_internal(key);
 }
 
-size_t storage_esp::total_size() const
+size_t storage_esp::total_size()
 {
     mutex_guard lock(_mutex);
     
@@ -319,7 +319,7 @@ size_t storage_esp::total_size() const
     return total;
 }
 
-size_t storage_esp::used_size() const
+size_t storage_esp::used_size()
 {
     mutex_guard lock(_mutex);
     
