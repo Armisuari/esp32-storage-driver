@@ -26,7 +26,7 @@
 #endif
 
 // Mount configuration
-#define STORAGE_FORMAT_IF_MOUNT_FAILS false
+#define STORAGE_FORMAT_IF_MOUNT_FAILS true
 #define STORAGE_MAX_FILES 10
 
 // Default mount points for different filesystems
@@ -37,7 +37,7 @@
 #define STORAGE_DIR_PERMISSIONS 0755
 
 // File versioning configuration
-#define STORAGE_ENABLE_VERSIONING false  // Disabled by default for now
+#define STORAGE_ENABLE_VERSIONING true  // Disabled by default for now
 #define STORAGE_MAX_VERSION_HISTORY 5    // Keep last N versions of each file
 #define STORAGE_VERSION_METADATA_EXT ".meta"  // Extension for metadata files
 
