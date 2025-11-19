@@ -1,562 +1,592 @@
 #include "storage_esp.h"
-#include "log.h"
-#include <string.h>
-#include <errno.h>
-#include <sys/stat.h>
 #include <unistd.h>
-
-#if STORAGE_ENABLE_VERSIONING
-#include <vector>
+#include <errno.h>
 #include <algorithm>
-#include <ctime>
-#endif
 
 static const char* TAG = "storage_esp";
 
-storage_esp::storage_esp(storage_filesystem_t filesystem_type, 
-                        const char* partition_label,
-                        const char* base_path) 
-    : _fs_type(filesystem_type)
-    , _partition_label(partition_label)
-    , _base_path(base_path)
-    , _is_mounted(false)
-    , _mutex(nullptr)
-{
-    // Create FreeRTOS mutex
-    _mutex = xSemaphoreCreateMutex();
-    if (_mutex == nullptr) {
-        ESP_LOGE(TAG, "Failed to create mutex for storage");
-    }
-
-    ESP_LOGD(TAG, "Storage ESP instance created with filesystem: %s, partition: %s, base_path: %s",
-             (_fs_type == storage_filesystem_t::LITTLEFS) ? "LittleFS" : "SPIFFS",
-             _partition_label, _base_path);
+storage_esp::storage_esp() : storage_esp(STORAGE_DEFAULT_TYPE, STORAGE_DEFAULT_PARTITION_LABEL, STORAGE_DEFAULT_BASE_PATH) {
 }
 
-storage_esp::~storage_esp()
-{
-    if (_is_mounted) {
-        _deinit_filesystem();
+storage_esp::storage_esp(storage_type_t type, const std::string& partition)
+    : storage_type(type), partition_label(partition), is_mounted(false) {
+    
+    if (type == STORAGE_TYPE_SPIFFS) {
+        base_path = STORAGE_SPIFFS_BASE_PATH;
+    } else {
+        base_path = STORAGE_LITTLEFS_BASE_PATH;
     }
     
-    // Delete FreeRTOS mutex
-    if (_mutex != nullptr) {
-        vSemaphoreDelete(_mutex);
-        _mutex = nullptr;
-    }
-    
-    ESP_LOGD(TAG, "Storage ESP instance destroyed");
+    init_default_config();
 }
 
-bool storage_esp::begin()
-{
-    mutex_guard lock(_mutex);
+storage_esp::storage_esp(storage_type_t type, const std::string& partition, const std::string& mount_point)
+    : storage_type(type), partition_label(partition), base_path(mount_point), is_mounted(false) {
     
-    if (_is_mounted) {
-        ESP_LOGW(TAG, "Filesystem already mounted");
+    init_default_config();
+}
+
+storage_esp::~storage_esp() {
+    if (is_mounted) {
+        unmount();
+    }
+    
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    if (storage_mutex != nullptr) {
+        vSemaphoreDelete(storage_mutex);
+    }
+#endif
+}
+
+void storage_esp::init_default_config() {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    storage_mutex = xSemaphoreCreateMutex();
+    if (storage_mutex == nullptr) {
+        ESP_LOGE(TAG, "Failed to create storage mutex");
+    }
+#endif
+
+#if STORAGE_ENABLE_DEBUG_LOGGING
+    ESP_LOGI(TAG, "Storage initialized: type=%s, partition=%s, base_path=%s",
+             get_storage_type_name(), partition_label.c_str(), base_path.c_str());
+#endif
+}
+
+std::string storage_esp::get_full_path(const std::string& relative_path) const {
+    if (relative_path.empty()) {
+        return base_path;
+    }
+    if (relative_path[0] != '/') {
+        return base_path + "/" + relative_path;
+    }
+    return base_path + relative_path;
+}
+
+bool storage_esp::begin() {
+    return mount(STORAGE_FORMAT_IF_MOUNT_FAILS);
+}
+
+bool storage_esp::mount(bool format_on_fail) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (is_mounted) {
+        ESP_LOGW(TAG, "Storage already mounted");
         return true;
     }
-
+    
     esp_err_t ret = ESP_FAIL;
     
-    switch (_fs_type) {
-#ifdef STORAGE_LITTLEFS_SUPPORTED
-        case storage_filesystem_t::LITTLEFS:
-            ret = _init_littlefs();
-            break;
+    if (storage_type == STORAGE_TYPE_SPIFFS) {
+#ifdef STORAGE_SPIFFS_AVAILABLE
+        esp_vfs_spiffs_conf_t conf = {
+            .base_path = base_path.c_str(),
+            .partition_label = partition_label.c_str(),
+            .max_files = STORAGE_MAX_FILES,
+            .format_if_mount_failed = format_on_fail
+        };
+        
+        ret = esp_vfs_spiffs_register(&conf);
+        if (ret == ESP_OK) {
+#if STORAGE_ENABLE_DEBUG_LOGGING
+            ESP_LOGI(TAG, "SPIFFS mounted successfully on %s", base_path.c_str());
 #endif
-#ifdef STORAGE_SPIFFS_SUPPORTED
-        case storage_filesystem_t::SPIFFS:
-            ret = _init_spiffs();
-            break;
-#endif
-        default:
-            ESP_LOGE(TAG, "Unsupported filesystem type");
-            return false;
-    }
-
-    if (ret == ESP_OK) {
-        _is_mounted = true;
-        ESP_LOGI(TAG, "Filesystem mounted successfully at %s", _base_path);
-        return true;
-    } else {
-        ESP_LOGE(TAG, "Failed to mount filesystem: %s", esp_err_to_name(ret));
-        return false;
-    }
-}
-
-bool storage_esp::read_file(const std::string& key, void* data, size_t dataSize)
-{
-    mutex_guard lock(_mutex);
-    
-    if (!_is_mounted) {
-        ESP_LOGE(TAG, "Filesystem not mounted");
-        return false;
-    }
-
-    if (!_is_valid_path(key)) {
-        ESP_LOGE(TAG, "Invalid file path: %s", key.c_str());
-        return false;
-    }
-
-    std::string full_path = get_full_path(key);
-    
-    FILE* file = fopen(full_path.c_str(), "rb");
-    if (!file) {
-        ESP_LOGW(TAG, "Failed to open file for reading: %s (%s)", full_path.c_str(), strerror(errno));
-        return false;
-    }
-
-    size_t bytes_read = fread(data, 1, dataSize, file);
-    fclose(file);
-
-    if (bytes_read != dataSize) {
-        ESP_LOGW(TAG, "Read %zu bytes from %s, expected %zu bytes", bytes_read, key.c_str(), dataSize);
-        return false;
-    }
-
-    ESP_LOGD(TAG, "Successfully read %zu bytes from %s", bytes_read, key.c_str());
-    return true;
-}
-
-bool storage_esp::write_file(const std::string& key, const void* data, size_t dataSize)
-{
-    ESP_LOGI(TAG, "write_file called for: %s", key.c_str());
-    
-    mutex_guard lock(_mutex);
-    ESP_LOGI(TAG, "Mutex acquired");
-    
-    if (!_is_mounted) {
-        ESP_LOGE(TAG, "Filesystem not mounted");
-        return false;
-    }
-
-    if (!_is_valid_path(key)) {
-        ESP_LOGE(TAG, "Invalid file path: %s", key.c_str());
-        return false;
-    }
-
-    std::string full_path = get_full_path(key);
-    ESP_LOGI(TAG, "Full path: %s", full_path.c_str());
-    
-    // Ensure directory exists
-    ESP_LOGI(TAG, "Ensuring directory exists...");
-    if (!_ensure_directory_exists(full_path)) {
-        ESP_LOGE(TAG, "Failed to create directory for file: %s", full_path.c_str());
-        return false;
-    }
-
-#if STORAGE_ENABLE_VERSIONING
-    ESP_LOGI(TAG, "Versioning enabled, loading metadata...");
-    // Load existing metadata (if any)
-    file_version_metadata metadata;
-    _load_metadata(key, metadata);
-    ESP_LOGI(TAG, "Metadata loaded");
-    
-    // Archive current version if file exists
-    ESP_LOGI(TAG, "Checking if file exists...");
-    if (_exists_internal(key)) {
-        ESP_LOGI(TAG, "File exists, archiving current version...");
-        if (!_archive_current_version(key, metadata)) {
-            ESP_LOGW(TAG, "Failed to archive current version of %s", key.c_str());
-        }
-        ESP_LOGI(TAG, "Archiving completed");
-    } else {
-        ESP_LOGI(TAG, "File does not exist, no archiving needed");
-    }
-    
-    // Update metadata for new version
-    metadata.current_version++;
-    metadata.timestamp = _get_timestamp();
-    metadata.file_size = dataSize;
-    metadata.checksum = _calculate_crc32(data, dataSize);
-    
-    ESP_LOGD(TAG, "Writing file %s version %d (size: %zu, crc: 0x%08x)", 
-             key.c_str(), metadata.current_version, dataSize, metadata.checksum);
-#endif
-
-    // Write the file
-    FILE* file = fopen(full_path.c_str(), "wb");
-    if (!file) {
-        ESP_LOGE(TAG, "Failed to open file for writing: %s (%s)", full_path.c_str(), strerror(errno));
-        return false;
-    }
-
-    size_t bytes_written = fwrite(data, 1, dataSize, file);
-    fclose(file);
-
-    if (bytes_written != dataSize) {
-        ESP_LOGE(TAG, "Wrote %zu bytes to %s, expected %zu bytes", bytes_written, key.c_str(), dataSize);
-        return false;
-    }
-
-#if STORAGE_ENABLE_VERSIONING
-    // Save updated metadata
-    if (!_save_metadata(key, metadata)) {
-        ESP_LOGW(TAG, "Failed to save metadata for %s", key.c_str());
-    }
-#endif
-
-    ESP_LOGD(TAG, "Successfully wrote %zu bytes to %s", bytes_written, key.c_str());
-    return true;
-}
-
-bool storage_esp::erase_file(const std::string& key)
-{
-    mutex_guard lock(_mutex);
-    
-    if (!_is_mounted) {
-        ESP_LOGE(TAG, "Filesystem not mounted");
-        return false;
-    }
-
-    if (!_is_valid_path(key)) {
-        ESP_LOGE(TAG, "Invalid file path: %s", key.c_str());
-        return false;
-    }
-
-    std::string full_path = get_full_path(key);
-    
-    if (unlink(full_path.c_str()) != 0) {
-        if (errno == ENOENT) {
-            ESP_LOGW(TAG, "File does not exist: %s", key.c_str());
+            is_mounted = true;
         } else {
-            ESP_LOGE(TAG, "Failed to delete file %s: %s", key.c_str(), strerror(errno));
+            ESP_LOGE(TAG, "Failed to mount SPIFFS: %s", esp_err_to_name(ret));
+            if (!format_on_fail) {
+                ESP_LOGW(TAG, "Try mounting with format_on_fail=true if needed");
+            }
         }
+#else
+        ESP_LOGE(TAG, "SPIFFS not available - check storage_config.h");
+        return false;
+#endif
+    } else {
+#ifdef STORAGE_LITTLEFS_AVAILABLE
+        esp_vfs_littlefs_conf_t conf = {
+            .base_path = base_path.c_str(),
+            .partition_label = partition_label.c_str(),
+            .format_if_mount_failed = format_on_fail,
+            .dont_mount = false
+        };
+        
+        ret = esp_vfs_littlefs_register(&conf);
+        if (ret == ESP_OK) {
+#if STORAGE_ENABLE_DEBUG_LOGGING
+            ESP_LOGI(TAG, "LittleFS mounted successfully on %s", base_path.c_str());
+#endif
+            is_mounted = true;
+            
+            // Log filesystem info after successful mount
+            size_t total = 0, used = 0;
+            esp_littlefs_info(partition_label.c_str(), &total, &used);
+#if STORAGE_ENABLE_DEBUG_LOGGING
+            ESP_LOGI(TAG, "LittleFS info - Total: %d bytes, Used: %d bytes", total, used);
+#endif
+        } else {
+            ESP_LOGE(TAG, "Failed to mount LittleFS: %s", esp_err_to_name(ret));
+            if (!format_on_fail) {
+                ESP_LOGW(TAG, "Try mounting with format_on_fail=true if needed");
+            }
+        }
+#else
+        ESP_LOGE(TAG, "LittleFS not available - check storage_config.h");
+        return false;
+#endif
+    }
+    
+    return ret == ESP_OK;
+}
+
+bool storage_esp::unmount() {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted) {
+        ESP_LOGW(TAG, "Storage not mounted");
+        return true;
+    }
+    
+    bool ret = false;
+    
+    if (storage_type == STORAGE_TYPE_SPIFFS) {
+#ifdef STORAGE_SPIFFS_AVAILABLE
+        ret = esp_vfs_spiffs_unregister(partition_label.c_str()) == ESP_OK;
+#endif
+    } else {
+#ifdef STORAGE_LITTLEFS_AVAILABLE
+        ret = esp_vfs_littlefs_unregister(partition_label.c_str()) == ESP_OK;
+#endif
+    }
+    
+    if (ret) {
+#if STORAGE_ENABLE_DEBUG_LOGGING
+        ESP_LOGI(TAG, "%s unmounted successfully", get_storage_type_name());
+#endif
+        is_mounted = false;
+    } else {
+        ESP_LOGE(TAG, "Failed to unmount %s", get_storage_type_name());
+    }
+    
+    return ret;
+}
+
+bool storage_esp::format() {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted) {
+        ESP_LOGE(TAG, "Storage not mounted, cannot format");
         return false;
     }
+    
+    bool ret = false;
+    
+    if (storage_type == STORAGE_TYPE_SPIFFS) {
+#ifdef STORAGE_SPIFFS_AVAILABLE
+        ret = esp_spiffs_format(partition_label.c_str()) == ESP_OK;
+#endif
+    } else {
+#ifdef STORAGE_LITTLEFS_AVAILABLE
+        ret = esp_littlefs_format(partition_label.c_str()) == ESP_OK;
+#endif
+    }
+    
+    if (ret) {
+#if STORAGE_ENABLE_DEBUG_LOGGING
+        ESP_LOGI(TAG, "%s formatted successfully", get_storage_type_name());
+#endif
+    } else {
+        ESP_LOGE(TAG, "Failed to format %s", get_storage_type_name());
+    }
+    
+    return ret;
+}
 
-    ESP_LOGD(TAG, "Successfully deleted file: %s", key.c_str());
+bool storage_esp::exists(const std::string& key) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted) {
+        return false;
+    }
+    
+    std::string full_path = get_full_path(key);
+    struct stat st;
+    return stat(full_path.c_str(), &st) == 0;
+}
+
+size_t storage_esp::file_size(const std::string& key) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted) {
+        return 0;
+    }
+    
+    std::string full_path = get_full_path(key);
+    struct stat st;
+    if (stat(full_path.c_str(), &st) == 0) {
+        return st.st_size;
+    }
+    return 0;
+}
+
+bool storage_esp::read_file(const std::string& key, void* data, size_t data_size) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted || !data) {
+        return false;
+    }
+    
+    std::string full_path = get_full_path(key);
+    
+    FILE* f = fopen(full_path.c_str(), "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open file for reading: %s", full_path.c_str());
+        return false;
+    }
+    
+    size_t bytes_read = fread(data, 1, data_size, f);
+    fclose(f);
+    
+    if (bytes_read != data_size) {
+        ESP_LOGE(TAG, "Read size mismatch: expected %d, got %d", data_size, bytes_read);
+        return false;
+    }
+    
+#if STORAGE_ENABLE_DEBUG_LOGGING
+    ESP_LOGD(TAG, "Read %d bytes from %s", bytes_read, key.c_str());
+#endif
     return true;
 }
 
-size_t storage_esp::file_size(const std::string& key)
-{
-    mutex_guard lock(_mutex);
-    
-    if (!_is_mounted) {
-        ESP_LOGE(TAG, "Filesystem not mounted");
-        return 0;
-    }
+bool storage_esp::write_file(const std::string& key, const void* data, size_t data_size) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
 
-    if (!_is_valid_path(key)) {
-        ESP_LOGE(TAG, "Invalid file path: %s", key.c_str());
-        return 0;
-    }
-
-    std::string full_path = get_full_path(key);
-    
-    struct stat st;
-    if (stat(full_path.c_str(), &st) != 0) {
-        ESP_LOGD(TAG, "File does not exist or stat failed: %s", key.c_str());
-        return 0;
-    }
-
-    ESP_LOGD(TAG, "File %s size: %ld bytes", key.c_str(), st.st_size);
-    return st.st_size;
-}
-
-bool storage_esp::_exists_internal(const std::string& key)
-{
-    if (!_is_mounted) {
-        ESP_LOGE(TAG, "Filesystem not mounted");
+    if (!is_mounted || !data) {
         return false;
     }
-
-    if (!_is_valid_path(key)) {
-        ESP_LOGE(TAG, "Invalid file path: %s", key.c_str());
-        return false;
-    }
-
+    
     std::string full_path = get_full_path(key);
     
-    struct stat st;
-    bool file_exists = (stat(full_path.c_str(), &st) == 0) && S_ISREG(st.st_mode);
+    // Create parent directories if needed
+    size_t last_slash = full_path.rfind('/');
+    if (last_slash != std::string::npos && last_slash > base_path.length()) {
+        std::string dir_path = full_path.substr(0, last_slash);
+        create_directory_recursive(dir_path);
+    }
     
-    ESP_LOGD(TAG, "File %s exists: %s", key.c_str(), file_exists ? "true" : "false");
-    return file_exists;
+    FILE* f = fopen(full_path.c_str(), "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open file for writing: %s", full_path.c_str());
+        return false;
+    }
+    
+    size_t bytes_written = fwrite(data, 1, data_size, f);
+    fclose(f);
+    
+    if (bytes_written != data_size) {
+        ESP_LOGE(TAG, "Write size mismatch: expected %d, got %d", data_size, bytes_written);
+        return false;
+    }
+    
+#if STORAGE_ENABLE_DEBUG_LOGGING
+    ESP_LOGD(TAG, "Wrote %d bytes to %s", bytes_written, key.c_str());
+#endif
+    return true;
 }
 
-bool storage_esp::exists(const std::string& key)
-{
-    mutex_guard lock(_mutex);
-    return _exists_internal(key);
+bool storage_esp::erase_file(const std::string& key) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted) {
+        return false;
+    }
+    
+    std::string full_path = get_full_path(key);
+    
+    if (unlink(full_path.c_str()) == 0) {
+#if STORAGE_ENABLE_DEBUG_LOGGING
+        ESP_LOGD(TAG, "Deleted file: %s", key.c_str());
+#endif
+        return true;
+    }
+    
+    ESP_LOGE(TAG, "Failed to delete file: %s", full_path.c_str());
+    return false;
 }
 
-size_t storage_esp::total_size()
-{
-    mutex_guard lock(_mutex);
-    
-    if (!_is_mounted) {
-        ESP_LOGE(TAG, "Filesystem not mounted");
+size_t storage_esp::total_size() {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted) {
         return 0;
     }
-
+    
     size_t total = 0, used = 0;
-    esp_err_t ret = ESP_FAIL;
-
-    switch (_fs_type) {
-#ifdef STORAGE_LITTLEFS_SUPPORTED
-        case storage_filesystem_t::LITTLEFS:
-            ret = esp_littlefs_info(_partition_label, &total, &used);
-            break;
+    
+    if (storage_type == STORAGE_TYPE_SPIFFS) {
+#ifdef STORAGE_SPIFFS_AVAILABLE
+        esp_spiffs_info(partition_label.c_str(), &total, &used);
 #endif
-#ifdef STORAGE_SPIFFS_SUPPORTED
-        case storage_filesystem_t::SPIFFS:
-            ret = esp_spiffs_info(_partition_label, &total, &used);
-            break;
+    } else {
+#ifdef STORAGE_LITTLEFS_AVAILABLE
+        esp_littlefs_info(partition_label.c_str(), &total, &used);
 #endif
-        default:
-            ESP_LOGE(TAG, "Unsupported filesystem type for size query");
-            return 0;
     }
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get filesystem info: %s", esp_err_to_name(ret));
-        return 0;
-    }
-
+    
     return total;
 }
 
-size_t storage_esp::used_size()
-{
-    mutex_guard lock(_mutex);
+size_t storage_esp::used_size() {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted) {
+        return 0;
+    }
     
-    if (!_is_mounted) {
-        ESP_LOGE(TAG, "Filesystem not mounted");
-        return 0;
-    }
-
     size_t total = 0, used = 0;
-    esp_err_t ret = ESP_FAIL;
-
-    switch (_fs_type) {
-#ifdef STORAGE_LITTLEFS_SUPPORTED
-        case storage_filesystem_t::LITTLEFS:
-            ret = esp_littlefs_info(_partition_label, &total, &used);
-            break;
+    
+    if (storage_type == STORAGE_TYPE_SPIFFS) {
+#ifdef STORAGE_SPIFFS_AVAILABLE
+        esp_spiffs_info(partition_label.c_str(), &total, &used);
 #endif
-#ifdef STORAGE_SPIFFS_SUPPORTED
-        case storage_filesystem_t::SPIFFS:
-            ret = esp_spiffs_info(_partition_label, &total, &used);
-            break;
+    } else {
+#ifdef STORAGE_LITTLEFS_AVAILABLE
+        esp_littlefs_info(partition_label.c_str(), &total, &used);
 #endif
-        default:
-            ESP_LOGE(TAG, "Unsupported filesystem type for size query");
-            return 0;
     }
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get filesystem info: %s", esp_err_to_name(ret));
-        return 0;
-    }
-
+    
     return used;
 }
 
-bool storage_esp::format()
-{
-    mutex_guard lock(_mutex);
-    
-    if (!_is_mounted) {
-        ESP_LOGE(TAG, "Filesystem not mounted - cannot format");
-        return false;
-    }
-
-    ESP_LOGW(TAG, "Formatting filesystem - THIS WILL ERASE ALL DATA!");
-    
-    esp_err_t ret = ESP_FAIL;
-
-    switch (_fs_type) {
-#ifdef STORAGE_LITTLEFS_SUPPORTED
-        case storage_filesystem_t::LITTLEFS:
-            ret = esp_littlefs_format(_partition_label);
-            break;
-#endif
-#ifdef STORAGE_SPIFFS_SUPPORTED
-        case storage_filesystem_t::SPIFFS:
-            ret = esp_spiffs_format(_partition_label);
-            break;
-#endif
-        default:
-            ESP_LOGE(TAG, "Unsupported filesystem type for format");
-            return false;
-    }
-
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Filesystem formatted successfully");
+bool storage_esp::create_directory_recursive(const std::string& path) {
+    // Skip if path is just the base path
+    if (path == base_path || path.length() <= base_path.length()) {
         return true;
-    } else {
-        ESP_LOGE(TAG, "Failed to format filesystem: %s", esp_err_to_name(ret));
+    }
+    
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+    
+    // Create parent directory first
+    size_t last_slash = path.rfind('/');
+    if (last_slash != std::string::npos && last_slash > base_path.length()) {
+        std::string parent = path.substr(0, last_slash);
+        if (!create_directory_recursive(parent)) {
+            return false;
+        }
+    }
+    
+    // Create this directory
+    if (mkdir(path.c_str(), STORAGE_DIR_PERMISSIONS) == 0 || errno == EEXIST) {
+        return true;
+    }
+    
+    ESP_LOGE(TAG, "Failed to create directory: %s", path.c_str());
+    return false;
+}
+
+bool storage_esp::list_directory(const std::string& path, std::vector<file_info_t>& files) {
+    if (!is_mounted) {
         return false;
     }
-}
-
-std::string storage_esp::get_full_path(const std::string& key) const
-{
-    std::string full_path = _base_path;
     
-    // Ensure base path ends with slash
-    if (full_path.back() != '/') {
-        full_path += '/';
+    std::string full_path = get_full_path(path);
+    
+    DIR* dir = opendir(full_path.c_str());
+    if (!dir) {
+        ESP_LOGE(TAG, "Failed to open directory: %s", full_path.c_str());
+        return false;
     }
     
-    // Remove leading slash from key if present
-    std::string clean_key = key;
-    if (!clean_key.empty() && clean_key[0] == '/') {
-        clean_key = clean_key.substr(1);
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip . and ..
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        
+        std::string entry_path = full_path + "/" + entry->d_name;
+        struct stat st;
+        
+        if (stat(entry_path.c_str(), &st) == 0) {
+            file_info_t info;
+            info.path = path + "/" + entry->d_name;
+            info.size = st.st_size;
+            info.is_directory = S_ISDIR(st.st_mode);
+            files.push_back(info);
+        }
     }
     
-    full_path += clean_key;
-    return full_path;
+    closedir(dir);
+    return true;
 }
 
-#ifdef STORAGE_LITTLEFS_SUPPORTED
-esp_err_t storage_esp::_init_littlefs()
-{
-    ESP_LOGI(TAG, "Initializing LittleFS on partition '%s'", _partition_label);
+bool storage_esp::list_all_files(std::vector<file_info_t>& files) {
+    std::vector<std::string> dirs_to_scan;
+    dirs_to_scan.push_back("/");
     
-    // Configure LittleFS
-    memset(&_fs_conf.littlefs_conf, 0, sizeof(esp_vfs_littlefs_conf_t));
-    _fs_conf.littlefs_conf.base_path = _base_path;
-    _fs_conf.littlefs_conf.partition_label = _partition_label;
-    _fs_conf.littlefs_conf.format_if_mount_failed = STORAGE_FORMAT_IF_MOUNT_FAILS;
-    _fs_conf.littlefs_conf.dont_mount = false;
-
-    esp_err_t ret = esp_vfs_littlefs_register(&_fs_conf.littlefs_conf);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize LittleFS: %s", esp_err_to_name(ret));
+    while (!dirs_to_scan.empty()) {
+        std::string current_dir = dirs_to_scan.back();
+        dirs_to_scan.pop_back();
+        
+        std::vector<file_info_t> dir_contents;
+        if (!list_directory(current_dir, dir_contents)) {
+            continue;
+        }
+        
+        for (const auto& item : dir_contents) {
+            if (item.is_directory) {
+                dirs_to_scan.push_back(item.path);
+            } else {
+                files.push_back(item);
+            }
+        }
     }
     
-    return ret;
+    return true;
 }
+
+// Advanced file operations
+bool storage_esp::read_file_alloc(const std::string& key, uint8_t** data, size_t* size) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
 #endif
 
-#ifdef STORAGE_SPIFFS_SUPPORTED
-esp_err_t storage_esp::_init_spiffs()
-{
-    ESP_LOGI(TAG, "Initializing SPIFFS on partition '%s'", _partition_label);
-    
-    // Configure SPIFFS
-    memset(&_fs_conf.spiffs_conf, 0, sizeof(esp_vfs_spiffs_conf_t));
-    _fs_conf.spiffs_conf.base_path = _base_path;
-    _fs_conf.spiffs_conf.partition_label = _partition_label;
-    _fs_conf.spiffs_conf.max_files = STORAGE_MAX_FILES;
-    _fs_conf.spiffs_conf.format_if_mount_failed = STORAGE_FORMAT_IF_MOUNT_FAILS;
-
-    esp_err_t ret = esp_vfs_spiffs_register(&_fs_conf.spiffs_conf);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize SPIFFS: %s", esp_err_to_name(ret));
-    }
-    
-    return ret;
-}
-#endif
-
-void storage_esp::_deinit_filesystem()
-{
-    if (!_is_mounted) {
-        return;
-    }
-
-    esp_err_t ret = ESP_FAIL;
-    
-    switch (_fs_type) {
-#ifdef STORAGE_LITTLEFS_SUPPORTED
-        case storage_filesystem_t::LITTLEFS:
-            ret = esp_vfs_littlefs_unregister(_partition_label);
-            break;
-#endif
-#ifdef STORAGE_SPIFFS_SUPPORTED
-        case storage_filesystem_t::SPIFFS:
-            ret = esp_vfs_spiffs_unregister(_partition_label);
-            break;
-#endif
-        default:
-            ESP_LOGE(TAG, "Unsupported filesystem type for unmount");
-            return;
-    }
-
-    if (ret == ESP_OK) {
-        _is_mounted = false;
-        ESP_LOGI(TAG, "Filesystem unmounted successfully");
-    } else {
-        ESP_LOGE(TAG, "Failed to unmount filesystem: %s", esp_err_to_name(ret));
-    }
-}
-
-bool storage_esp::_is_valid_path(const std::string& key) const
-{
-    // Check for empty path
-    if (key.empty()) {
+    if (!is_mounted || !data || !size) {
         return false;
     }
 
-    // Check for invalid characters (basic validation)
-    if (key.find('\0') != std::string::npos) {
+    *size = file_size(key);
+    if (*size == 0) {
         return false;
     }
 
-    // Check for relative path components that could escape the filesystem
-    if (key.find("..") != std::string::npos) {
+    *data = (uint8_t*)malloc(*size);
+    if (!*data) {
+        ESP_LOGE(TAG, "Failed to allocate memory for file: %s", key.c_str());
         return false;
     }
 
-    // Path length check (reasonable limit)
-    if (key.length() > 255) {
+    if (!read_file(key, *data, *size)) {
+        free(*data);
+        *data = nullptr;
+        *size = 0;
         return false;
     }
 
     return true;
 }
 
-bool storage_esp::_ensure_directory_exists(const std::string& filepath) const
-{
-    // SPIFFS doesn't support directories - all files are in a flat namespace
-    // File paths with '/' are treated as part of the filename, not directory structure
-    if (_fs_type == storage_filesystem_t::SPIFFS) {
-        return true;  // No directory creation needed for SPIFFS
-    }
-    
-    size_t last_slash = filepath.find_last_of('/');
-    if (last_slash == std::string::npos) {
-        // No directory component
-        return true;
-    }
+bool storage_esp::rename_file(const std::string& old_key, const std::string& new_key) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
 
-    std::string dir_path = filepath.substr(0, last_slash);
-    
-    struct stat st;
-    if (stat(dir_path.c_str(), &st) == 0) {
-        // Path exists, check if it's a directory
-        return S_ISDIR(st.st_mode);
-    }
-
-    // Directory doesn't exist, try to create it
-    // Note: This is a simple implementation. For production, you might want
-    // to create parent directories recursively
-    if (mkdir(dir_path.c_str(), 0755) == 0) {
-        ESP_LOGD(TAG, "Created directory: %s", dir_path.c_str());
-        return true;
-    } else if (errno == EEXIST) {
-        // Directory was created by another thread/process
-        return true;
-    } else {
-        ESP_LOGE(TAG, "Failed to create directory %s: %s", dir_path.c_str(), strerror(errno));
+    if (!is_mounted) {
         return false;
     }
+
+    std::string old_path = get_full_path(old_key);
+    std::string new_path = get_full_path(new_key);
+
+    if (rename(old_path.c_str(), new_path.c_str()) == 0) {
+#if STORAGE_ENABLE_DEBUG_LOGGING
+        ESP_LOGD(TAG, "Renamed file: %s -> %s", old_key.c_str(), new_key.c_str());
+#endif
+        return true;
+    }
+
+    ESP_LOGE(TAG, "Failed to rename file: %s -> %s", old_key.c_str(), new_key.c_str());
+    return false;
 }
 
-#if STORAGE_ENABLE_VERSIONING
+// Directory operations
+bool storage_esp::create_directory(const std::string& path) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted) {
+        return false;
+    }
+
+    std::string full_path = get_full_path(path);
+    return create_directory_recursive(full_path);
+}
+
+bool storage_esp::verify_file_integrity(const std::string& key, size_t expected_size, uint32_t* checksum) {
+#if STORAGE_ENABLE_MUTEX_PROTECTION
+    mutex_guard guard(storage_mutex);
+#endif
+
+    if (!is_mounted) {
+        return false;
+    }
+
+    // Check if file exists and has expected size
+    size_t actual_size = file_size(key);
+    if (actual_size != expected_size) {
+        ESP_LOGE(TAG, "File size mismatch for %s: expected %d, actual %d", 
+                 key.c_str(), expected_size, actual_size);
+        return false;
+    }
+
+    // If checksum verification is requested
+    if (checksum != nullptr) {
+        // Read file and calculate checksum (simple implementation)
+        uint8_t* data = nullptr;
+        size_t size = 0;
+        
+        if (!read_file_alloc(key, &data, &size)) {
+            return false;
+        }
+
+        uint32_t calculated_checksum = 0;
+        for (size_t i = 0; i < size; i++) {
+            calculated_checksum += data[i];
+        }
+
+        free(data);
+
+        if (calculated_checksum != *checksum) {
+            ESP_LOGE(TAG, "Checksum mismatch for %s: expected 0x%08X, calculated 0x%08X",
+                     key.c_str(), *checksum, calculated_checksum);
+            return false;
+        }
+    }
+
+    return true;
+}
 
 // ========== File Versioning Public Methods ==========
 
+#if STORAGE_ENABLE_VERSIONING
 uint32_t storage_esp::get_file_version(const std::string& key)
 {
-    mutex_guard lock(_mutex);
+    mutex_guard guard(storage_mutex);
     
-    if (!_is_mounted || !_exists_internal(key)) {
+    if (!is_mounted || !exists(key)) {
         return 0;
     }
     
@@ -570,9 +600,9 @@ uint32_t storage_esp::get_file_version(const std::string& key)
 
 bool storage_esp::get_file_version_info(const std::string& key, file_version_info& info)
 {
-    mutex_guard lock(_mutex);
+    mutex_guard guard(storage_mutex);
     
-    if (!_is_mounted || !_exists_internal(key)) {
+    if (!is_mounted || !exists(key)) {
         return false;
     }
     
@@ -582,7 +612,6 @@ bool storage_esp::get_file_version_info(const std::string& key, file_version_inf
     }
     
     info.version = metadata.current_version;
-    info.timestamp = metadata.timestamp;
     info.size = metadata.file_size;
     info.is_current = true;
     
@@ -592,9 +621,9 @@ bool storage_esp::get_file_version_info(const std::string& key, file_version_inf
 std::vector<file_version_info> storage_esp::list_file_versions(const std::string& key)
 {
     std::vector<file_version_info> versions;
-    mutex_guard lock(_mutex);
+    mutex_guard guard(storage_mutex);
     
-    if (!_is_mounted || !_exists_internal(key)) {
+    if (!is_mounted || !exists(key)) {
         return versions;
     }
     
@@ -606,7 +635,6 @@ std::vector<file_version_info> storage_esp::list_file_versions(const std::string
     // Add current version
     file_version_info current;
     current.version = metadata.current_version;
-    current.timestamp = metadata.timestamp;
     current.size = metadata.file_size;
     current.is_current = true;
     versions.push_back(current);
@@ -621,7 +649,6 @@ std::vector<file_version_info> storage_esp::list_file_versions(const std::string
         if (stat(version_path.c_str(), &st) == 0) {
             file_version_info historical;
             historical.version = version_num;
-            historical.timestamp = st.st_mtime;
             historical.size = st.st_size;
             historical.is_current = false;
             versions.push_back(historical);
@@ -639,9 +666,9 @@ std::vector<file_version_info> storage_esp::list_file_versions(const std::string
 
 bool storage_esp::read_file_version(const std::string& key, uint32_t version, void* data, size_t dataSize)
 {
-    mutex_guard lock(_mutex);
+    mutex_guard guard(storage_mutex);
     
-    if (!_is_mounted) {
+    if (!is_mounted) {
         ESP_LOGE(TAG, "Filesystem not mounted");
         return false;
     }
@@ -676,9 +703,9 @@ bool storage_esp::read_file_version(const std::string& key, uint32_t version, vo
 
 bool storage_esp::file_has_changed(const std::string& key, uint32_t last_known_version)
 {
-    mutex_guard lock(_mutex);
+    mutex_guard guard(storage_mutex);
     
-    if (!_is_mounted || !_exists_internal(key)) {
+    if (!is_mounted || !exists(key)) {
         return false;
     }
     
@@ -692,9 +719,9 @@ bool storage_esp::file_has_changed(const std::string& key, uint32_t last_known_v
 
 bool storage_esp::restore_file_version(const std::string& key, uint32_t version)
 {
-    mutex_guard lock(_mutex);
+    mutex_guard guard(storage_mutex);
     
-    if (!_is_mounted) {
+    if (!is_mounted) {
         ESP_LOGE(TAG, "Filesystem not mounted");
         return false;
     }
@@ -736,10 +763,10 @@ bool storage_esp::restore_file_version(const std::string& key, uint32_t version)
 
 uint32_t storage_esp::cleanup_old_versions(const std::string& key)
 {
-    mutex_guard lock(_mutex);
+    mutex_guard guard(storage_mutex);
     uint32_t cleaned_count = 0;
     
-    if (!_is_mounted) {
+    if (!is_mounted) {
         ESP_LOGE(TAG, "Filesystem not mounted");
         return 0;
     }
@@ -846,11 +873,6 @@ uint32_t storage_esp::_calculate_crc32(const void* data, size_t length) const
     }
     
     return crc ^ 0xFFFFFFFF;
-}
-
-uint32_t storage_esp::_get_timestamp() const
-{
-    return (uint32_t)time(nullptr);
 }
 
 bool storage_esp::_archive_current_version(const std::string& key, file_version_metadata& metadata)

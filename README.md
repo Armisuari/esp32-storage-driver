@@ -1,206 +1,237 @@
 # ESP32 Storage Driver Usage Guide
 
-This guide shows how to use the refactored ESP32 storage driver with native ESP-IDF APIs.
+This guide shows how to use the enhanced ESP32 storage driver with native ESP-IDF APIs, full configuration support, and thread safety.
 
 ## Features
 
 - **Native ESP-IDF APIs**: No Arduino framework dependencies
-- **Multiple Filesystem Support**: LittleFS and SPIFFS
-- **Built-in Thread Safety**: FreeRTOS mutex protection for all operations
-- **Simple Configuration**: Easy filesystem selection through configuration
+- **Multiple Filesystem Support**: LittleFS and SPIFFS (configurable)
+- **Built-in Thread Safety**: FreeRTOS mutex protection for all operations (configurable)
+- **Centralized Configuration**: All settings managed through `storage_config.h`
 - **Comprehensive Error Handling**: Detailed logging and error reporting
 - **Automatic Resource Management**: Proper cleanup and RAII principles
+- **Advanced File Operations**: File allocation, renaming, integrity verification
+- **Directory Management**: Recursive directory creation and listing
+
+## Configuration
+
+All storage driver settings are centralized in `storage_config.h`:
+
+```cpp
+// Filesystem availability (enable/disable filesystems)
+#define STORAGE_SPIFFS_AVAILABLE
+#define STORAGE_LITTLEFS_AVAILABLE
+
+// Default settings
+#define STORAGE_DEFAULT_TYPE STORAGE_TYPE_LITTLEFS
+#define STORAGE_DEFAULT_PARTITION_LABEL "spiffs"
+#define STORAGE_DEFAULT_BASE_PATH "/littlefs"
+
+// Mount configuration
+#define STORAGE_FORMAT_IF_MOUNT_FAILS false
+#define STORAGE_MAX_FILES 10
+
+// Base paths for different filesystems
+#define STORAGE_SPIFFS_BASE_PATH "/spiffs"
+#define STORAGE_LITTLEFS_BASE_PATH "/littlefs"
+
+// Thread safety (can be disabled for single-threaded applications)
+#define STORAGE_ENABLE_MUTEX_PROTECTION true
+#define STORAGE_MUTEX_TIMEOUT_MS portMAX_DELAY
+
+// Logging control
+#define STORAGE_ENABLE_DEBUG_LOGGING true
+
+// Directory permissions
+#define STORAGE_DIR_PERMISSIONS 0755
+```
 
 ## Basic Usage
 
-### Creating and Using Storage
+### Creating Storage Instances
 
 ```cpp
 #include "storage_esp.h"
 
-// Create storage instance with default configuration (LittleFS)
+// Default configuration (uses settings from storage_config.h)
 storage_esp storage;
 
-// Or specify filesystem type and partition
-storage_esp storage(storage_filesystem_t::LITTLEFS, "storage", "/data");
+// Specific filesystem with default partition and mount point
+storage_esp littlefs_storage(STORAGE_TYPE_LITTLEFS);
 
+// Custom partition label
+storage_esp custom_storage(STORAGE_TYPE_LITTLEFS, "my_partition");
+
+// Full custom configuration
+storage_esp full_custom(STORAGE_TYPE_SPIFFS, "spiffs_part", "/custom");
+```
+
+### Initializing and Using Storage
+
+```cpp
 // Initialize the filesystem
 if (!storage.begin()) {
     ESP_LOGE("app", "Failed to mount filesystem");
     return;
 }
 
-// Use the storage
+// Check if mounted
+if (!storage.get_is_mounted()) {
+    ESP_LOGE("app", "Storage not ready");
+    return;
+}
+
+// Basic file operations
 std::string data = "Hello, World!";
 if (storage.write_file("test.txt", data.c_str(), data.length())) {
     ESP_LOGI("app", "File written successfully");
-}
-```
-
-### Different Storage Configurations
-
-```cpp
-#include "storage_esp.h"
-
-// Default configuration (uses STORAGE_DEFAULT_TYPE from config)
-storage_esp default_storage;
-
-// Specific LittleFS configuration
-storage_esp littlefs_storage(
-    storage_filesystem_t::LITTLEFS,
-    "storage",           // partition label
-    "/data"              // mount point
-);
-
-// Specific SPIFFS configuration (if enabled)
-storage_esp spiffs_storage(
-    storage_filesystem_t::SPIFFS,
-    "spiffs_partition",  // partition label
-    "/spiffs"            // mount point
-);
-```
-
-## File Operations
-
-### Writing Files
-
-```cpp
-storage_esp storage;
-storage.begin();
-
-std::string config_data = "{\"version\":1,\"enabled\":true}";
-if (!storage.write_file("config.json", config_data.c_str(), config_data.length())) {
-    ESP_LOGE("app", "Failed to write config file");
-}
-```
-
-### Reading Files
-
-```cpp
-// First, get the file size
-size_t file_size = storage.file_size("config.json");
-if (file_size > 0) {
-    std::vector<char> buffer(file_size + 1);  // +1 for null terminator
-    if (storage.read_file("config.json", buffer.data(), file_size)) {
-        buffer[file_size] = '\0';  // Null terminate
-        ESP_LOGI("app", "Config content: %s", buffer.data());
+    
+    // Read it back
+    char buffer[256];
+    if (storage.read_file("test.txt", buffer, sizeof(buffer))) {
+        ESP_LOGI("app", "File content: %s", buffer);
     }
 }
 ```
 
-### Checking File Existence
+## File Operations
 
-```cpp
-if (storage.exists("config.json")) {
-    ESP_LOGI("app", "Config file exists");
-} else {
-    ESP_LOGI("app", "Config file does not exist");
-}
-```
-
-### Deleting Files
-
-```cpp
-if (storage.erase_file("old_data.txt")) {
-    ESP_LOGI("app", "File deleted successfully");
-}
-```
-
-## Filesystem Information
+### Writing Files with Directory Creation
 
 ```cpp
 storage_esp storage;
 storage.begin();
 
+// Automatically creates nested directories
+std::string config_data = "{\"version\":1,\"enabled\":true}";
+if (!storage.write_file("config/device/settings.json", config_data.c_str(), config_data.length())) {
+    ESP_LOGE("app", "Failed to write config file");
+}
+```
+
+### Dynamic Memory Allocation for File Reading
+
+```cpp
+// Automatically allocates exact amount needed
+uint8_t* file_data = nullptr;
+size_t file_size = 0;
+
+if (storage.read_file_alloc("large_data.bin", &file_data, &file_size)) {
+    ESP_LOGI("app", "Read %d bytes from file", file_size);
+    
+    // Process the data...
+    
+    // Don't forget to free the allocated memory
+    free(file_data);
+}
+```
+
+### File Management Operations
+
+```cpp
+// Check if file exists
+if (storage.exists("config.json")) {
+    // Get file size
+    size_t size = storage.file_size("config.json");
+    ESP_LOGI("app", "Config file size: %d bytes", size);
+    
+    // Rename file
+    if (storage.rename_file("config.json", "config_backup.json")) {
+        ESP_LOGI("app", "File renamed successfully");
+    }
+    
+    // Verify file integrity
+    uint32_t expected_checksum = 0x12345678;
+    if (storage.verify_file_integrity("config_backup.json", size, &expected_checksum)) {
+        ESP_LOGI("app", "File integrity verified");
+    }
+    
+    // Delete file
+    storage.erase_file("config_backup.json");
+}
+```
+
+## Directory Operations
+
+```cpp
+storage_esp storage;
+storage.begin();
+
+// Create directory structure
+if (storage.create_directory("logs/2024/november")) {
+    ESP_LOGI("app", "Directory structure created");
+}
+
+// List directory contents
+std::vector<file_info_t> files;
+if (storage.list_directory("logs", files)) {
+    for (const auto& file : files) {
+        ESP_LOGI("app", "%s: %s (%d bytes)", 
+                 file.path.c_str(), 
+                 file.is_directory ? "DIR" : "FILE",
+                 file.size);
+    }
+}
+
+// List all files in filesystem
+std::vector<file_info_t> all_files;
+if (storage.list_all_files(all_files)) {
+    ESP_LOGI("app", "Total files: %d", all_files.size());
+}
+```
+
+## Filesystem Information and Management
+
+```cpp
+storage_esp storage;
+storage.begin();
+
+// Get filesystem statistics
 ESP_LOGI("app", "Total space: %zu bytes", storage.total_size());
 ESP_LOGI("app", "Used space: %zu bytes", storage.used_size());
 ESP_LOGI("app", "Free space: %zu bytes", 
          storage.total_size() - storage.used_size());
+
+// Get storage configuration
+ESP_LOGI("app", "Storage type: %s", 
+         storage.get_storage_type() == STORAGE_TYPE_LITTLEFS ? "LittleFS" : "SPIFFS");
+ESP_LOGI("app", "Base path: %s", storage.get_base_path().c_str());
+ESP_LOGI("app", "Partition: %s", storage.get_partition_label().c_str());
 ```
 
-## Configuration
-
-### storage_config.h
+## Advanced Mount Operations
 
 ```cpp
-// Available filesystem types
-enum class storage_filesystem_t {
-    SPIFFS,
-    LITTLEFS
-};
+storage_esp storage(STORAGE_TYPE_LITTLEFS, "storage");
 
-// Enable the filesystems you want to use
-#define STORAGE_LITTLEFS_AVAILABLE
-// #define STORAGE_SPIFFS_AVAILABLE
-
-// Configuration
-#define STORAGE_DEFAULT_TYPE storage_filesystem_t::LITTLEFS
-#define STORAGE_DEFAULT_PARTITION_LABEL "storage"
-#define STORAGE_FORMAT_IF_MOUNT_FAILS true
-#define STORAGE_MAX_FILES 10
-```
-
-## Partition Table Requirements
-
-Make sure your partition table includes a storage partition. Example `partitions.csv`:
-
-```csv
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 1M,
-storage,  data, spiffs,  0x110000, 1M,
-```
-
-For LittleFS, you can use either `spiffs` or `littlefs` as SubType in ESP-IDF 4.4+.
-
-## Error Handling
-
-The storage driver provides comprehensive error handling:
-
-```cpp
-storage_esp storage;
-
-if (!storage.begin()) {
-    ESP_LOGE("app", "Storage mount failed - check partition table and configuration");
-    return ESP_FAIL;
+// Mount with specific options
+if (!storage.mount(true)) {  // format_on_fail = true
+    ESP_LOGE("app", "Failed to mount even with formatting");
+    return;
 }
 
-// All file operations return bool for success/failure
-if (!storage.write_file("data.bin", data, size)) {
-    ESP_LOGE("app", "Write failed - check disk space and permissions");
+// Manually format if needed
+if (/* some condition */) {
+    ESP_LOGW("app", "Formatting filesystem...");
+    if (!storage.format()) {
+        ESP_LOGE("app", "Format failed");
+    }
 }
-```
 
-## Migration from Arduino Framework
-
-If migrating from Arduino SPIFFS/LittleFS libraries:
-
-### Before (Arduino)
-```cpp
-#include <SPIFFS.h>
-
-SPIFFS.begin();
-File file = SPIFFS.open("/config.txt", "w");
-file.write(data, size);
-file.close();
-```
-
-### After (ESP-IDF)
-```cpp
-#include "storage_esp.h"
-
-storage_esp storage;
-storage.begin();
-storage.write_file("config.txt", data, size);
+// Proper cleanup
+storage.unmount();
 ```
 
 ## Thread Safety
 
-The storage driver provides **built-in thread safety** using FreeRTOS mutexes. All public methods are automatically protected, so you can safely use the storage from multiple tasks without additional synchronization:
+The storage driver provides **built-in thread safety** when `STORAGE_ENABLE_MUTEX_PROTECTION` is enabled in `storage_config.h`. All public methods are automatically protected:
 
 ```cpp
-// Task 1
+// Safe to use from multiple tasks simultaneously
+storage_esp shared_storage;
+shared_storage.begin();
+
+// Task 1: Configuration updates
 void config_task(void* pvParameters) {
     storage_esp* storage = (storage_esp*)pvParameters;
     
@@ -211,12 +242,12 @@ void config_task(void* pvParameters) {
     }
 }
 
-// Task 2
+// Task 2: Data logging  
 void log_task(void* pvParameters) {
     storage_esp* storage = (storage_esp*)pvParameters;
     
     while(1) {
-        std::string log_entry = get_log_entry();
+        std::string log_entry = generate_log_entry();
         storage->write_file("system.log", log_entry.c_str(), log_entry.length());
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -224,217 +255,132 @@ void log_task(void* pvParameters) {
 
 // Main application
 void app_main() {
-    storage_esp storage;
-    storage.begin();
-    
     // Both tasks can safely use the same storage instance
-    xTaskCreate(config_task, "config", 4096, &storage, 5, NULL);
-    xTaskCreate(log_task, "log", 4096, &storage, 5, NULL);
+    xTaskCreate(config_task, "config", 4096, &shared_storage, 5, NULL);
+    xTaskCreate(log_task, "log", 4096, &shared_storage, 5, NULL);
 }
 ```
 
-### Thread Safety Implementation
+### Thread Safety Configuration
 
-- **FreeRTOS Mutexes**: Uses `xSemaphoreCreateMutex()` for efficient blocking
-- **RAII Lock Guard**: Automatic mutex acquisition/release using custom `mutex_guard` class
-- **Atomic Operations**: Each public method is fully protected
-- **Deadlock Prevention**: Mutexes are always acquired in the same order
+- **Enable/Disable**: Set `STORAGE_ENABLE_MUTEX_PROTECTION` in `storage_config.h`
+- **Mutex Timeout**: Configure `STORAGE_MUTEX_TIMEOUT_MS` (default: `portMAX_DELAY`)
+- **Performance**: Minimal overhead, file I/O is the bottleneck
+- **RAII Protection**: Automatic mutex management using custom `mutex_guard` class
 
-### Performance Considerations
-
-- **Minimal Overhead**: Mutex operations are very fast on ESP32
-- **No Busy Waiting**: Tasks block efficiently when waiting for mutex
-- **File Operations**: The actual I/O operations are the bottleneck, not the mutex
-- **Configurable Timeout**: Uses `portMAX_DELAY` for reliability (can be customized if needed)
-
-## Build Configuration
-
-Add these to your component's `CMakeLists.txt` or `component.mk`:
-
-```cmake
-# For ESP-IDF CMake
-idf_component_register(
-    SRCS "storage_esp.cpp" "storage_factory.cpp"
-    INCLUDE_DIRS "."
-    REQUIRES "esp_littlefs"  # or "spiffs" for SPIFFS
-)
-```
-
-Enable the filesystem in `sdkconfig`:
-```
-CONFIG_LITTLEFS_PAGE_SIZE=256
-CONFIG_LITTLEFS_OBJ_NAME_LEN=64
-```
-
-## File Versioning Features
-
-### Overview
-
-The enhanced storage driver now includes comprehensive file versioning capabilities:
-
-- **Automatic Version Tracking**: Every file write automatically increments the version number
-- **Version History**: Configurable number of previous versions kept (default: 5)
-- **Metadata Storage**: Each file has associated metadata with version, timestamp, size, and checksum
-- **Change Detection**: Easy detection of file modifications since last known version
-- **Version Restoration**: Ability to restore files to previous versions
-- **Thread-Safe Operations**: All versioning operations are protected by the same mutex system
-
-### Configuration
-
-Enable versioning in `storage_config.h`:
-
-```cpp
-// File versioning configuration
-#define STORAGE_ENABLE_VERSIONING true
-#define STORAGE_MAX_VERSION_HISTORY 5  // Keep last N versions of each file
-#define STORAGE_VERSION_METADATA_EXT ".meta"  // Extension for metadata files
-```
-
-### Basic Versioning Usage
+## Error Handling and Debugging
 
 ```cpp
 storage_esp storage;
-storage.begin();
 
-// Write initial version (automatically becomes version 1)
-std::string config_v1 = R"({"timeout": 5000})";
-storage.write_file("config.json", config_v1.c_str(), config_v1.length());
+// Enable detailed logging via configuration
+// #define STORAGE_ENABLE_DEBUG_LOGGING true
 
-// Write updated version (automatically becomes version 2)
-std::string config_v2 = R"({"timeout": 3000, "retries": 3})";
-storage.write_file("config.json", config_v2.c_str(), config_v2.length());
-
-// Check current version
-uint32_t current_version = storage.get_file_version("config.json");
-ESP_LOGI("app", "Current version: %d", current_version); // Prints: 2
-
-// Check if file has changed since version 1
-if (storage.file_has_changed("config.json", 1)) {
-    ESP_LOGI("app", "File has been modified!");
-}
-```
-
-### Version Information and History
-
-```cpp
-// Get detailed version information
-file_version_info info;
-if (storage.get_file_version_info("config.json", info)) {
-    ESP_LOGI("app", "Version %d: %zu bytes, timestamp: %d", 
-             info.version, info.size, info.timestamp);
-}
-
-// List all available versions
-auto versions = storage.list_file_versions("config.json");
-for (const auto& ver : versions) {
-    ESP_LOGI("app", "Version %d: %zu bytes, current: %s", 
-             ver.version, ver.size, ver.is_current ? "yes" : "no");
-}
-```
-
-### Reading Specific Versions
-
-```cpp
-// Read current version (same as normal read_file)
-char current_data[256];
-storage.read_file("config.json", current_data, sizeof(current_data));
-
-// Read a specific version
-char version_1_data[256];
-storage.read_file_version("config.json", 1, version_1_data, sizeof(version_1_data));
-```
-
-### Version Restoration
-
-```cpp
-// Restore file to a previous version
-if (storage.restore_file_version("config.json", 1)) {
-    ESP_LOGI("app", "Successfully restored to version 1");
-    // This creates a new version with the content from version 1
-}
-```
-
-### Change Detection for IoT Applications
-
-```cpp
-// Typical IoT scenario: check for configuration updates
-class ConfigManager {
-private:
-    storage_esp* storage;
-    uint32_t last_known_config_version = 0;
-
-public:
-    void check_for_config_updates() {
-        if (storage->file_has_changed("device_config.json", last_known_config_version)) {
-            ESP_LOGI("config", "Configuration updated, reloading...");
-            load_config();
-            last_known_config_version = storage->get_file_version("device_config.json");
-        }
-    }
+if (!storage.begin()) {
+    ESP_LOGE("app", "Storage mount failed - check partition table and configuration");
     
-    void load_config() {
-        size_t config_size = storage->file_size("device_config.json");
-        std::vector<char> config_data(config_size);
-        if (storage->read_file("device_config.json", config_data.data(), config_size)) {
-            // Parse and apply configuration
-            parse_json_config(config_data.data());
-        }
+    // Try different mount options
+    if (!storage.mount(true)) {  // Allow formatting
+        ESP_LOGE("app", "Storage completely failed - hardware issue?");
+        return ESP_FAIL;
     }
-};
-```
-
-### Maintenance and Cleanup
-
-```cpp
-// Clean up old versions beyond the configured limit
-uint32_t cleaned = storage.cleanup_old_versions("large_log_file.txt");
-ESP_LOGI("app", "Cleaned up %d old versions", cleaned);
-
-// Clean up all files (if key is empty)
-storage.cleanup_old_versions("");
-```
-
-### File Structure
-
-With versioning enabled, the filesystem structure looks like:
-
-```
-/storage/
-├── config.json           # Current version
-├── config.json.meta      # Metadata (version info, checksums, etc.)
-├── config.json.v1        # Version 1 backup
-├── config.json.v2        # Version 2 backup
-├── sensor_data.csv       # Current version
-├── sensor_data.csv.meta  # Metadata
-└── sensor_data.csv.v1    # Version 1 backup
-```
-
-### Performance Considerations
-
-- **Write Performance**: Each write operation now involves metadata updates and potentially archiving the current version
-- **Storage Usage**: Each versioned file uses approximately `(history_count + 1) * average_file_size` storage
-- **Memory Usage**: Metadata structures are small (~100 bytes per file)
-- **Thread Safety**: All versioning operations are atomic and thread-safe
-
-### Migration from Non-Versioned Files
-
-Existing files without version metadata will automatically start versioning from version 1 when first written to with the enhanced driver.
-
-### Error Handling
-
-```cpp
-// Version-related operations have specific error handling
-uint32_t version = storage.get_file_version("nonexistent.txt");
-if (version == 0) {
-    ESP_LOGW("app", "File doesn't exist or has no version info");
 }
 
-// Check if specific version exists before reading
-auto versions = storage.list_file_versions("config.json");
-bool version_3_exists = std::any_of(versions.begin(), versions.end(),
-                                   [](const auto& v) { return v.version == 3; });
-if (version_3_exists) {
-    // Safe to read version 3
-    storage.read_file_version("config.json", 3, buffer, size);
+// All file operations return bool for success/failure
+if (!storage.write_file("critical_data.bin", data, size)) {
+    ESP_LOGE("app", "Critical write failed - check disk space: %d free", 
+             storage.total_size() - storage.used_size());
 }
 ```
+
+## Partition Table Configuration
+
+Ensure your `partitions.csv` includes appropriate storage partitions:
+
+```csv
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 1M,
+storage,  data, spiffs,  0x110000, 1M,
+```
+
+For LittleFS, you can use either `spiffs` or `littlefs` as SubType (ESP-IDF 4.4+).
+
+## Build Configuration
+
+### CMakeLists.txt
+
+```cmake
+idf_component_register(
+    SRCS "storage_esp.cpp" 
+    INCLUDE_DIRS "." "../interface"
+    REQUIRES "esp_littlefs" "spiffs"  # Include both for flexibility
+)
+```
+
+### sdkconfig
+
+```
+# LittleFS Configuration
+CONFIG_LITTLEFS_PAGE_SIZE=256
+CONFIG_LITTLEFS_OBJ_NAME_LEN=64
+
+# SPIFFS Configuration  
+CONFIG_SPIFFS_PAGE_SIZE=256
+CONFIG_SPIFFS_OBJ_NAME_LEN=64
+```
+
+## Migration from Previous Version
+
+### Constructor Changes
+
+```cpp
+// Old way
+storage_esp storage(STORAGE_TYPE_LITTLEFS, "partition");
+
+// New way (same, but with more options)
+storage_esp storage;  // Uses defaults from config
+// OR
+storage_esp storage(STORAGE_TYPE_LITTLEFS, "partition");  // Explicit
+// OR  
+storage_esp storage(STORAGE_TYPE_LITTLEFS, "partition", "/custom_mount");  // Full control
+```
+
+### Configuration Migration
+
+Move hardcoded values to `storage_config.h`:
+
+```cpp
+// Old: hardcoded in source files
+#define STORAGE_MAX_FILES 10
+
+// New: in storage_config.h  
+#define STORAGE_MAX_FILES 10
+#define STORAGE_FORMAT_IF_MOUNT_FAILS false
+#define STORAGE_DEFAULT_TYPE STORAGE_TYPE_LITTLEFS
+```
+
+## Performance Tips
+
+1. **Minimize File Operations**: Batch writes when possible
+2. **Use Appropriate Buffer Sizes**: Read/write in reasonable chunks
+3. **Enable Debug Logging Conditionally**: Disable in production for better performance
+4. **Consider Thread Safety Needs**: Disable mutex protection for single-threaded applications
+5. **Choose Right Filesystem**: LittleFS generally better for power-loss protection
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Mount Failures**: Check partition table, partition label, and filesystem availability flags
+2. **Thread Deadlocks**: Ensure `STORAGE_MUTEX_TIMEOUT_MS` is appropriate for your use case
+3. **Memory Issues**: Use `read_file_alloc()` for dynamic allocation, remember to `free()` result
+4. **Permission Errors**: Verify `STORAGE_DIR_PERMISSIONS` setting for directory creation
+
+### Debug Steps
+
+1. Enable debug logging: `#define STORAGE_ENABLE_DEBUG_LOGGING true`
+2. Check filesystem info after mount: `total_size()` and `used_size()`
+3. Verify partition exists: Use ESP-IDF partition tools
+4. Test with formatting enabled: `mount(true)`
